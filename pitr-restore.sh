@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Restaura um banco até um horário exato, baixando dump + binlogs do R2.
-# Uso: TARGET_HOST=<host> TARGET_PASSWORD=<senha root> pitr-restore.sh "AAAA-MM-DD HH:MM:SS"
-#      O horário é de Brasília. Usa as mesmas variáveis R2_* e NAME do agente.
+# Uso: TARGET_HOST=<host> TARGET_PASSWORD=<senha root> pitr-restore.sh "AAAA-MM-DD HH:MM:SS" [UTC]
+#      Sem o segundo argumento, o horário é de Brasília. Com "UTC", é UTC.
+#      Usa as mesmas variáveis R2_* e NAME do agente. YES=1 pula a confirmação.
 set -euo pipefail
 
 : "${1:?informe o horário de Brasília, ex.: \"2026-11-21 01:05:00\"}"
@@ -21,9 +22,14 @@ export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
   RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 SRC="r2:$R2_BUCKET/pitr/$NAME"
 
-STOP_UTC=$(date -u -d "TZ=\"America/Sao_Paulo\" $1" '+%F %T')
+if [ "${2:-}" = "UTC" ]; then
+  STOP_UTC=$(date -u -d "$1" '+%F %T')
+  echo "Alvo: $STOP_UTC UTC = $(TZ=America/Sao_Paulo date -d "$STOP_UTC UTC" '+%F %T') Brasília"
+else
+  STOP_UTC=$(date -u -d "TZ=\"America/Sao_Paulo\" $1" '+%F %T')
+  echo "Alvo: $1 Brasília = $STOP_UTC UTC"
+fi
 STOP_KEY=$(date -u -d "$STOP_UTC" '+%F_%H%M%S')
-echo "Alvo: $1 (Brasília) = $STOP_UTC UTC"
 
 WORK=$(mktemp -d /tmp/restore.XXXX)
 trap 'rm -rf "$WORK"' EXIT
@@ -49,11 +55,21 @@ echo "Binlogs baixados: ${#LOGS[@]} (${LOGS[0]} até ${LOGS[-1]})"
 export MYSQL_PWD="$TARGET_PASSWORD"
 DB=(mariadb -h "$TARGET_HOST" -u "$TARGET_USER")
 
-# 3. Prévia do que será reaplicado
+# 3. Prévia do que será reaplicado, e confirmação
 echo "Operações que serão reaplicadas após o dump:"
 mariadb-binlog --base64-output=decode-rows -v --start-position="$START_POS" \
-  --stop-datetime="$STOP_UTC" "${LOGS[@]/#/$WORK/binlog/}" \
+  --stop-datetime="$STOP_UTC" "${LOGS[@]/#/$WORK/binlog/}" 2>"$WORK/preview.err" \
   | grep -E '^### (INSERT|UPDATE|DELETE)' | sort | uniq -c || true
+if grep -q "Did not reach stop datetime" "$WORK/preview.err"; then
+  echo
+  echo "ATENÇÃO: o horário alvo é DEPOIS do último evento que está no R2."
+  echo "Ou o fuso está errado (Brasília x UTC), ou o binlog desse período ainda não foi enviado."
+  echo "Se continuar, TUDO que está no R2 será aplicado, inclusive um eventual desastre."
+fi
+if [ "${YES:-0}" != "1" ]; then
+  read -r -p "Digite 'sim' para restaurar em $TARGET_HOST: " ans
+  [ "$ans" = "sim" ] || { echo "Cancelado."; exit 1; }
+fi
 
 # 4. Restaurar dump e aplicar binlogs até o horário alvo
 echo "Restaurando dump..."
